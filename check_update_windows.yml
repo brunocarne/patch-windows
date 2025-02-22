@@ -1,0 +1,157 @@
+---
+# Playbook para verificar e instalar atualizações do Windows com reinicialização automática
+- name: Verificar e instalar atualizações do Windows com reinicialização automática
+  hosts: all
+  strategy: serverscom.mitogen.mitogen_free
+  serial: 15 # Executa em 15 hosts por vez
+  gather_facts: false
+
+  vars_files:
+    - roles/vars/vars.yml # Arquivo com variáveis externas
+
+  vars:
+    reboot_required: false # Flag para controle de reinicialização
+    initial_reboot_timeout: 1800 # Timeout de 30 minutos para reboot
+    post_reboot_delay: 60 # Delay de 60 segundos após reboot
+    required_space_gb: 7 # Espaço mínimo necessário em GB
+
+  tasks:
+    # Bloco de pré-requisitos para execução
+    - name: Pre-requisitos
+      block:
+        # Obtém e salva a política de execução atual do PowerShell
+        - name: Salvar a política de execução atual
+          win_shell: |
+            $ExecutionPolicy = Get-ExecutionPolicy -Scope Process
+            Write-Output $ExecutionPolicy
+          register: current_execution_policy
+          ignore_errors: yes
+
+        # Define política de execução como Unrestricted para permitir scripts
+        - name: Definir a política de execução como 'Unrestricted'
+          win_shell: Set-ExecutionPolicy -ExecutionPolicy Unrestricted -Scope Process -Force
+
+        # Testa conectividade com o servidor
+        - name: Verificar conectividade com o servidor
+          win_ping:
+          register: ping_result
+          ignore_unreachable: yes
+          ignore_errors: yes
+
+        # Define variável de status do servidor
+        - name: Definir status do servidor
+          set_fact:
+            server_unreachable: "{{ ping_result.ping is not defined or ping_result.ping != 'pong' }}"
+      tags: pre_check
+
+    # Bloco de verificação de recursos do sistema
+    - name: Verificação de recursos
+      block:
+        # Verifica espaço livre no disco C:
+        - name: Verificar espaço em disco disponível
+          win_shell: |
+            $disk = Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Name -eq "C" }
+            $disk.Free / 1GB -as [int]
+          register: disk_space
+          when: not server_unreachable
+
+        # Define variáveis de controle de espaço
+        - name: Definir variáveis de espaço
+          set_fact:
+            disk_space_available: "{{ disk_space.stdout | int }}"
+            sufficient_space: "{{ disk_space.stdout | int >= required_space_gb | int }}"
+          when: disk_space is defined and not server_unreachable
+
+        # Verifica se há reinicializações pendentes
+        - name: Verificar reinicializações pendentes
+          win_shell: |
+            $pendingReboot = Get-WmiObject -Class Win32_ComputerSystem | Select-Object -ExpandProperty RebootPending
+            if ($pendingReboot) { Write-Output "true" } else { Write-Output "false" }
+          register: pending_reboot
+          when: not server_unreachable
+      tags: check_resources
+
+    # Bloco de instalação das atualizações
+    - name: Processo de atualização
+      block:
+        # Reinicia se houver reboot pendente
+        - name: Reiniciar se houver reboot pendente
+          win_reboot:
+          when: pending_reboot.stdout_lines[0] == "true"
+
+        # Instala atualizações de segurança e críticas
+        - name: Instalar atualizações
+          ansible.windows.win_updates:
+            category_names:
+              - "SecurityUpdates"
+              - "CriticalUpdates"
+            state: installed
+          register: result
+          when: sufficient_space and not server_unreachable
+
+        # Define se é necessário reiniciar após atualizações
+        - name: Definir necessidade de reboot
+          set_fact:
+            reboot_required: "{{ result.reboot_required | default(false) | bool }}"
+          when: result is defined and sufficient_space and not server_unreachable
+      tags: update
+
+    # Bloco de ações pós-atualização
+    - name: Pós-atualização
+      block:
+        # Reinicia o servidor se necessário
+        - name: Reiniciar servidor
+          win_reboot:
+            reboot_timeout: "{{ initial_reboot_timeout }}"
+          when: reboot_required and sufficient_space and not server_unreachable
+
+        # Verifica se servidor está online após reboot
+        - name: Verificar servidor após reboot
+          win_ping:
+          register: ping_result_after_reboot
+          retries: 10
+          delay: 60
+          until: ping_result_after_reboot.ping is defined and ping_result_after_reboot.ping == 'pong'
+          when: reboot_required and sufficient_space
+
+        # Lista atualizações instaladas # Converte para JSON linha 122
+        - name: Mostrar atualizações instaladas
+          win_shell: |
+            Get-Hotfix | Sort-Object -Property InstalledOn -Descending | Select-Object -First 2
+          become: yes
+          become_method: runas
+          become_user: SYSTEM
+          ignore_errors: yes
+          register: installed_updates
+          when: reboot_required and sufficient_space and ping_result_after_reboot.ping == 'pong'
+
+        # Exibe as atualizações no console # Linha 133 lê o JSON
+        - name: Exibir atualizações
+          debug:
+            msg: "{{ installed_updates.stdout_lines }}"
+          tags: post_update
+
+        # Reporta status ao WSUS
+        - name: Reportar ao WSUS
+          win_shell: wuauclt /reportnow
+          when: reboot_required and sufficient_space and ping_result_after_reboot.ping == 'pong'
+
+        # Restaura a política de execução original
+        - name: Restaurar política de execução
+          win_shell: Set-ExecutionPolicy -ExecutionPolicy '{{ current_execution_policy.stdout }}' -Scope Process -Force
+          ignore_errors: yes
+
+        # Obtém o hostname do servidor
+        - name: Obter hostname do servidor
+          win_shell: hostname
+          register: hostname
+          ignore_errors: yes
+
+        # Gera relatório final da execução
+        - name: Relatório final
+          debug:
+            msg:
+              - "Servidor: {{ hostname.stdout | replace('\n', '') | default('Indefinido') }} - {{ inventory_hostname }}"
+              - "Atualizações instaladas: {{ result.updates | default([]) | length }}"
+              - "Reboot realizado: {{ reboot_required | default(false) }}"
+          tags: cleanup
